@@ -1,0 +1,147 @@
+diff --git a/openai_realtime_client/openai_realtime_client/client/realtime_client.py b/openai_realtime_client/openai_realtime_client/client/realtime_client.py
+index 4e2d1a7..c9da5e1 100644
+--- a/openai_realtime_client/openai_realtime_client/client/realtime_client.py
++++ b/openai_realtime_client/openai_realtime_client/client/realtime_client.py
+@@ -1,15 +1,17 @@
+ import asyncio
+ import websockets
+ import json
+ import base64
+ import io
+
+ from typing import Optional, Callable, List, Dict, Any
+ from enum import Enum
+ from pydub import AudioSegment
+
+ from llama_index.core.tools import BaseTool, AsyncBaseTool, ToolSelection, adapt_to_async_tool, call_tool_with_selection
+
+
+ class TurnDetectionMode(Enum):
+     SERVER_VAD = "server_vad"
+     MANUAL = "manual"
+@@ -76,17 +78,20 @@ class RealtimeClient:
+     async def connect(self) -> None:
+         """Establish WebSocket connection with the Realtime API."""
+         url = f"{self.base_url}?model={self.model}"
+-        headers = {
+-            "Authorization": f"Bearer {self.api_key}",
+-            "OpenAI-Beta": "realtime=v1"
+-        }
+-
+-        self.ws = await websockets.connect(url, extra_headers=headers)
++        # Use a sequence of (key, value) tuples for broad websockets compatibility
++        headers = [
++            ("Authorization", f"Bearer {self.api_key}"),
++            ("OpenAI-Beta", "realtime=v1"),
++        ]
++
++        self.ws = await websockets.connect(url, extra_headers=headers)
+
+         # Set up default session configuration
+         tools = [t.metadata.to_openai_tool()['function'] for t in self.tools]
+         for t in tools:
+             t['type'] = 'function'  # OpenAI tool calls expect type=function
+
+-        if self.turn_detection_mode == TurnDetectionMode.MANUAL:
++        if self.turn_detection_mode == TurnDetectionMode.MANUAL:
+             await self.update_session({
+                 "modalities": ["text", "audio"],
+                 "instructions": self.instructions,
+                 "voice": self.voice,
+-                "input_audio_format": "pcm16",
++                # MUST be a string value (not an object)
++                "input_audio_format": "pcm16",
+                 "output_audio_format": "pcm16",
+                 "input_audio_transcription": {
+-                    "model": "whisper-1"
++                    "model": "whisper-1"
+                 },
+                 "tools": tools,
+                 "tool_choice": "auto",
+                 "temperature": self.temperature,
+             })
+-        elif self.turn_detection_mode == TurnDetectionMode.SERVER_VAD:
++        elif self.turn_detection_mode == TurnDetectionMode.SERVER_VAD:
+             await self.update_session({
+                 "modalities": ["text", "audio"],
+                 "instructions": self.instructions,
+                 "voice": self.voice,
+-                "input_audio_format": "pcm16",
++                # MUST be a string value (not an object)
++                "input_audio_format": "pcm16",
+                 "output_audio_format": "pcm16",
+                 "input_audio_transcription": {
+-                    "model": "whisper-1"
++                    "model": "whisper-1"
+                 },
+                 "turn_detection": {
+                     "type": "server_vad",
+                     "threshold": 0.5,
+                     "prefix_padding_ms": 500,
+                     "silence_duration_ms": 200
+                 },
+                 "tools": tools,
+                 "tool_choice": "auto",
+                 "temperature": self.temperature,
+             })
+         else:
+             raise ValueError(f"Invalid turn detection mode: {self.turn_detection_mode}")
+@@ -165,22 +170,44 @@ class RealtimeClient:
+                 if event_type == "error":
+                     print(f"Error: {event['error']}")
+                     continue
+-
++
+                 # Track response state
+                 elif event_type == "response.created":
+                     self._current_response_id = event.get("response", {}).get("id")
+                     self._is_responding = True
+-
++
+                 elif event_type == "response.output_item.added":
+                     self._current_item_id = event.get("item", {}).get("id")
+-
++
+                 elif event_type == "response.done":
+                     self._is_responding = False
+                     self._current_response_id = None
+                     self._current_item_id = None
+-
++
+                 # Handle interruptions
+                 elif event_type == "input_audio_buffer.speech_started":
+-                    print("\n[Speech detected")
++                    print("\n[Speech detected]")
+                     if self._is_responding:
+                         await self.handle_interruption()
+
+                     if self.on_interrupt:
+                         self.on_interrupt()
+
+-                elif event_type == "input_audio_buffer.speech_stopped":
+-                    print("\n[Speech ended]")
++                elif event_type == "input_audio_buffer.speech_stopped":
++                    print("\n[Speech ended]")
++                    # With server VAD, ask the model to respond right after speech ends
++                    if self.turn_detection_mode == TurnDetectionMode.SERVER_VAD:
++                        await self.create_response()
++
++                # If server-side transcription fails, still proceed to response
++                elif event_type == "conversation.item.input_audio_transcription.failed":
++                    err = event.get("error", {})
++                    print(f"[Transcription failed] {err}")
++                    if self.turn_detection_mode == TurnDetectionMode.SERVER_VAD:
++                        await self.create_response()
+
+                 # Handle normal response events
+-                elif event_type == "response.text.delta":
+-                    if self.on_text_delta:
+-                        self.on_text_delta(event["delta"])
++                elif event_type in ("response.text.delta", "response.output_text.delta"):
++                    if self.on_text_delta and "delta" in event:
++                        self.on_text_delta(event["delta"])
+
+                 elif event_type == "response.audio.delta":
+                     if self.on_audio_delta:
+                         audio_bytes = base64.b64decode(event["delta"])
+                         self.on_audio_delta(audio_bytes)
